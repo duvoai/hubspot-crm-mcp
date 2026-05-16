@@ -105,6 +105,38 @@ function compactResults(
   };
 }
 
+// Accept `properties` as either a JSON array (canonical) or a comma-separated
+// string (LLM tool-call quirk; some clients serialize arrays as strings).
+// Returns null when no usable value is present so callers can apply their own
+// defaults without conflating "empty" with "unset".
+function normalizeProperties(value: unknown): string[] | null {
+  if (Array.isArray(value)) {
+    const out = (value as unknown[]).map((v) => String(v).trim()).filter((v) => v.length > 0);
+    return out.length > 0 ? out : null;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const out = value.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return out.length > 0 ? out : null;
+  }
+  return null;
+}
+
+// Accept `filters` either as a flat array of {propertyName, operator, value}
+// triples (wrapped into a single filterGroup) or pre-grouped via
+// `filterGroups`. Returns the raw filterGroups payload HubSpot expects, or
+// null when nothing usable is supplied.
+function normalizeFilterGroups(args: Record<string, unknown>): Array<{ filters: Array<Record<string, unknown>> }> | null {
+  const groups = args.filterGroups;
+  if (Array.isArray(groups) && groups.length > 0) {
+    return groups as Array<{ filters: Array<Record<string, unknown>> }>;
+  }
+  const flat = args.filters;
+  if (Array.isArray(flat) && flat.length > 0) {
+    return [{ filters: flat as Array<Record<string, unknown>> }];
+  }
+  return null;
+}
+
 // HubSpot API helper
 async function hubspot(path: string, method = 'GET', body?: object): Promise<unknown> {
   const token = process.env.HUBSPOT_ACCESS_TOKEN;
@@ -718,7 +750,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_get_deal',
-    description: 'Get a single deal by ID. Returns full deal details including all properties.',
+    description: 'Get a single deal by ID. Pass `properties` to retrieve custom HubSpot fields (e.g. gong_summary, slack_channel_id). Without `properties` HubSpot returns its 8 default fields only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -726,7 +758,7 @@ const TOOLS = [
         properties: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Properties to return (e.g., dealname, amount, closedate, dealstage)',
+          description: 'Properties to return (e.g. dealname, amount, gong_summary, slack_channel_id). Accepts an array or a comma-separated string.',
         },
       },
       required: ['id'],
@@ -768,7 +800,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_search_deals',
-    description: 'Search deals with filters. Use this to find deals by owner, stage, close date, or amount. Great for "deals closing this month" or "my open deals" queries.',
+    description: 'Search deals with filters. Convenience fields (owner/stage/close/amount) plus arbitrary HubSpot search filters via `filters` (flat AND group) or `filterGroups` (raw passthrough). Use this for queries like "deals closing this month", "deals where hs_object_id = X", or any custom property predicate.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -779,10 +811,20 @@ const TOOLS = [
         closeAfter: { type: 'string', description: 'Filter deals closing after this date (ISO 8601)' },
         closeBefore: { type: 'string', description: 'Filter deals closing before this date (ISO 8601)' },
         minAmount: { type: 'string', description: 'Filter deals with amount >= this value' },
+        filters: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Flat list of HubSpot filter clauses (e.g. [{propertyName,operator,value}]) ANDed with the convenience fields into one filterGroup. For OR semantics across groups, use `filterGroups` instead.',
+        },
+        filterGroups: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Raw HubSpot filterGroups payload (e.g. [{filters:[{propertyName,operator,value}]}]). Multiple groups are ORed; multiple filters within a group are ANDed.',
+        },
         properties: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Properties to return',
+          description: 'Properties to return. Accepts an array or a comma-separated string.',
         },
         limit: { type: 'number', description: 'Max results (1-100, default: 20)', default: 20 },
       },
@@ -1064,7 +1106,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         params.set('limit', String(Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100)));
         if (args.after) params.set('after', String(args.after));
         const defaultContactProps = ['email', 'firstname', 'lastname', 'company', 'jobtitle', 'phone', 'lifecyclestage', 'hs_lead_status', 'hs_last_sales_activity_date'];
-        const propsToRequest = Array.isArray(args.properties) && args.properties.length > 0 ? args.properties as string[] : defaultContactProps;
+        const propsToRequest = normalizeProperties(args.properties) ?? defaultContactProps;
         propsToRequest.forEach((p) => params.append('properties', String(p)));
         const data = await hubspot(`/crm/v3/objects/contacts?${params}`) as { results: Record<string, unknown>[]; paging?: unknown };
 
@@ -1084,9 +1126,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
       case 'hubspot_get_contact': {
         const params = new URLSearchParams();
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        }
+        const props = normalizeProperties(args.properties);
+        if (props) props.forEach((p) => params.append('properties', p));
         return hubspot(`/crm/v3/objects/contacts/${args.id}?${params}`);
       }
 
@@ -1103,8 +1144,9 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         const defaultSearchProps = ['email', 'firstname', 'lastname', 'company', 'jobtitle', 'phone', 'lifecyclestage', 'hs_lead_status', 'hs_last_sales_activity_date'];
         const body: Record<string, unknown> = { limit: Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100) };
         if (args.query) body.query = args.query;
-        if (args.filterGroups) body.filterGroups = args.filterGroups;
-        body.properties = Array.isArray(args.properties) && args.properties.length > 0 ? args.properties : defaultSearchProps;
+        const filterGroups = normalizeFilterGroups(args);
+        if (filterGroups) body.filterGroups = filterGroups;
+        body.properties = normalizeProperties(args.properties) ?? defaultSearchProps;
         if (Array.isArray(args.sorts)) body.sorts = args.sorts;
         const data = await hubspot('/crm/v3/objects/contacts/search', 'POST', body) as { results: Record<string, unknown>[]; total?: number; paging?: unknown };
 
@@ -1128,9 +1170,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         const params = new URLSearchParams();
         params.set('limit', String(Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100)));
         if (args.after) params.set('after', String(args.after));
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        }
+        const props = normalizeProperties(args.properties);
+        if (props) props.forEach((p) => params.append('properties', p));
         const data = await hubspot(`/crm/v3/objects/companies?${params}`) as { results: Record<string, unknown>[]; paging?: unknown };
         const maxLen = args.maxPropertyLength === 0 ? Infinity : (Number(args.maxPropertyLength) || DEFAULT_MAX_PROPERTY_LENGTH);
         return compactResults(data, { maxPropertyLength: maxLen, includeMetadata: Boolean(args.includeMetadata) });
@@ -1138,9 +1179,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
       case 'hubspot_get_company': {
         const params = new URLSearchParams();
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        }
+        const props = normalizeProperties(args.properties);
+        if (props) props.forEach((p) => params.append('properties', p));
         return hubspot(`/crm/v3/objects/companies/${args.id}?${params}`);
       }
 
@@ -1156,8 +1196,10 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       case 'hubspot_search_companies': {
         const body: Record<string, unknown> = { limit: Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100) };
         if (args.query) body.query = args.query;
-        if (args.filterGroups) body.filterGroups = args.filterGroups;
-        if (Array.isArray(args.properties)) body.properties = args.properties;
+        const filterGroups = normalizeFilterGroups(args);
+        if (filterGroups) body.filterGroups = filterGroups;
+        const props = normalizeProperties(args.properties);
+        if (props) body.properties = props;
         if (Array.isArray(args.sorts)) body.sorts = args.sorts;
         const data = await hubspot('/crm/v3/objects/companies/search', 'POST', body) as { results: Record<string, unknown>[]; total?: number; paging?: unknown };
         const maxLen = args.maxPropertyLength === 0 ? Infinity : (Number(args.maxPropertyLength) || DEFAULT_MAX_PROPERTY_LENGTH);
@@ -1467,12 +1509,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       case 'hubspot_get_task': {
         const taskId = String(args.taskId);
         const params = new URLSearchParams();
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        } else {
-          // Default task properties
-          ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_task_priority', 'hs_timestamp', 'hubspot_owner_id'].forEach(p => params.append('properties', p));
-        }
+        const props = normalizeProperties(args.properties) ?? ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_task_priority', 'hs_timestamp', 'hubspot_owner_id'];
+        props.forEach((p) => params.append('properties', p));
         return hubspot(`/crm/v3/objects/tasks/${taskId}?${params}`);
       }
 
@@ -1542,12 +1580,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         const params = new URLSearchParams();
         params.set('limit', String(Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100)));
         if (args.after) params.set('after', String(args.after));
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        } else {
-          // Default properties for deals
-          ['dealname', 'amount', 'dealstage', 'pipeline', 'closedate', 'hubspot_owner_id'].forEach(p => params.append('properties', p));
-        }
+        const props = normalizeProperties(args.properties) ?? ['dealname', 'amount', 'dealstage', 'pipeline', 'closedate', 'hubspot_owner_id'];
+        props.forEach((p) => params.append('properties', p));
         const data = await hubspot(`/crm/v3/objects/deals?${params}`) as { results: Record<string, unknown>[]; paging?: unknown };
         return {
           results: data.results.map(d => ({ id: (d as { id: string }).id, properties: (d as { properties: unknown }).properties })),
@@ -1557,9 +1591,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
       case 'hubspot_get_deal': {
         const params = new URLSearchParams();
-        if (Array.isArray(args.properties)) {
-          args.properties.forEach((p) => params.append('properties', String(p)));
-        }
+        const props = normalizeProperties(args.properties);
+        if (props) props.forEach((p) => params.append('properties', p));
         return hubspot(`/crm/v3/objects/deals/${args.id}?${params}`);
       }
 
@@ -1620,36 +1653,45 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       }
 
       case 'hubspot_search_deals': {
-        const filters: Array<{ propertyName: string; operator: string; value: string }> = [];
+        const builtFilters: Array<Record<string, unknown>> = [];
 
         if (args.ownerId) {
-          filters.push({ propertyName: 'hubspot_owner_id', operator: 'EQ', value: String(args.ownerId) });
+          builtFilters.push({ propertyName: 'hubspot_owner_id', operator: 'EQ', value: String(args.ownerId) });
         }
         if (args.dealstage) {
-          filters.push({ propertyName: 'dealstage', operator: 'EQ', value: String(args.dealstage) });
+          builtFilters.push({ propertyName: 'dealstage', operator: 'EQ', value: String(args.dealstage) });
         }
         if (args.pipeline) {
-          filters.push({ propertyName: 'pipeline', operator: 'EQ', value: String(args.pipeline) });
+          builtFilters.push({ propertyName: 'pipeline', operator: 'EQ', value: String(args.pipeline) });
         }
         if (args.closeAfter) {
-          filters.push({ propertyName: 'closedate', operator: 'GTE', value: String(args.closeAfter) });
+          builtFilters.push({ propertyName: 'closedate', operator: 'GTE', value: String(args.closeAfter) });
         }
         if (args.closeBefore) {
-          filters.push({ propertyName: 'closedate', operator: 'LTE', value: String(args.closeBefore) });
+          builtFilters.push({ propertyName: 'closedate', operator: 'LTE', value: String(args.closeBefore) });
         }
         if (args.minAmount) {
-          filters.push({ propertyName: 'amount', operator: 'GTE', value: String(args.minAmount) });
+          builtFilters.push({ propertyName: 'amount', operator: 'GTE', value: String(args.minAmount) });
         }
+
+        // Merge convenience filters with any user-supplied filterGroups / filters.
+        // User filterGroups become additional groups (OR semantics across groups);
+        // a flat `filters` array merges into the convenience group (AND within group).
+        const userGroups = Array.isArray(args.filterGroups) ? (args.filterGroups as Array<{ filters: Array<Record<string, unknown>> }>) : [];
+        const userFlatFilters = Array.isArray(args.filters) ? (args.filters as Array<Record<string, unknown>>) : [];
+        const convenienceGroup = [...builtFilters, ...userFlatFilters];
+
+        const filterGroups: Array<{ filters: Array<Record<string, unknown>> }> = [];
+        if (convenienceGroup.length > 0) filterGroups.push({ filters: convenienceGroup });
+        filterGroups.push(...userGroups);
 
         const body: Record<string, unknown> = {
           limit: Math.min(Number(args.limit) || DEFAULT_MAX_RESULTS, 100),
-          properties: Array.isArray(args.properties) ? args.properties : ['dealname', 'amount', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id'],
+          properties: normalizeProperties(args.properties) ?? ['dealname', 'amount', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id'],
           sorts: [{ propertyName: 'closedate', direction: 'ASCENDING' }],
         };
         if (args.query) body.query = args.query;
-        if (filters.length > 0) {
-          body.filterGroups = [{ filters }];
-        }
+        if (filterGroups.length > 0) body.filterGroups = filterGroups;
 
         const data = await hubspot('/crm/v3/objects/deals/search', 'POST', body) as { results: Record<string, unknown>[]; total?: number; paging?: unknown };
         return {
@@ -1681,7 +1723,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       case 'hubspot_search_deals_by_stage': {
         const dealstage = String(args.dealstage);
         const limit = Math.min(Number(args.limit) || 50, 100);
-        const properties = Array.isArray(args.properties) ? args.properties as string[] : ['dealname', 'amount', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id'];
+        const properties = normalizeProperties(args.properties) ?? ['dealname', 'amount', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id'];
 
         const body = {
           filterGroups: [{ filters: [{ propertyName: 'dealstage', operator: 'EQ', value: dealstage }] }],
